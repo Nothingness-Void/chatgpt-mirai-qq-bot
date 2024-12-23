@@ -2,6 +2,9 @@ import re
 import time
 from base64 import b64decode, b64encode
 from typing import Union, Optional
+from aiohttp import TCPConnector, ClientSession
+import ssl
+import html
 
 import aiohttp
 from aiocqhttp import CQHttp, Event, MessageSegment
@@ -16,10 +19,9 @@ import constants
 from constants import config, botManager
 from manager.bot import BotManager
 from middlewares.ratelimit import manager as ratelimit_manager
-from universal import handle_message
+from universal import handle_message, ImageMessage
 
 bot = CQHttp()
-
 
 class MentionMe:
     """At 账号或者提到账号群昵称"""
@@ -37,32 +39,20 @@ class MentionMe:
                 return chain.removeprefix(" ")
         raise ExecutionStop
 
-
 class Image(GraiaImage):
-    async def get_bytes(self) -> bytes:
-        """尝试获取消息元素的 bytes, 注意, 你无法获取并不包含 url 且不包含 base64 属性的本元素的 bytes.
+    def __init__(self, *, url: Optional[str] = None, **kwargs):
+        super().__init__(**kwargs)  # 调用父类的构造函数
+        self.url = url
 
-        Raises:
-            ValueError: 你尝试获取并不包含 url 属性的本元素的 bytes.
+class ImageMessage:
+    def __init__(self, text, image_url_list):
+        self.text = text
+        self.image_url_list = image_url_list  # 现在存储 URL 列表
 
-        Returns:
-            bytes: 元素原始数据
-        """
-        if self.base64:
-            return b64decode(self.base64)
-        if not self.url:
-            raise ValueError("you should offer a url.")
-        async with aiohttp.ClientSession() as session:
-            async with session.get(self.url) as response:
-                response.raise_for_status()
-                data = await response.read()
-                self.base64 = b64encode(data).decode("ascii")
-                return data
+    def __str__(self):
+        return self.text
 
-
-# TODO: use MessageSegment
-# https://github.com/nonebot/aiocqhttp/blob/master/docs/common-topics.md
-def transform_message_chain(text: str) -> MessageChain:
+async def transform_message_chain(text: str) -> MessageChain:
     pattern = r"\[CQ:(\w+),([^\]]+)\]"
     matches = re.finditer(pattern, text)
 
@@ -75,25 +65,41 @@ def transform_message_chain(text: str) -> MessageChain:
 
     messages = []
     start = 0
+    image_urls = []  # 新增：用于存储图片 URL 的列表
+
     for match in matches:
         cq_type, params_str = match.groups()
-        params = dict(re.findall(r"(\w+)=([^,]+)", params_str))
+        # 使用改进后的正则表达式，并进行 HTML 解码
+        params = dict(re.findall(r"(\w+)=((?:(?!,\w+=).)+)", html.unescape(params_str)))
+
         if message_class := message_classes.get(cq_type):
+            # 处理 CQ 码之前的文本
             text_segment = text[start:match.start()]
-            if text_segment and not text_segment.startswith('[CQ:reply,'):
+            if text_segment:
                 messages.append(Plain(text_segment))
+
+            # 处理 CQ 码
             if cq_type == "at":
                 if params.get('qq') == 'all':
                     continue
                 params["target"] = int(params.pop("qq"))
+            elif cq_type == "image":
+                if url := params.get("url"):
+                    image_urls.append(url)  # 将图片 URL 添加到列表中
+
+            logger.debug(f"cq_type: {cq_type}, params: {params}")
             elem = message_class(**params)
+            logger.debug(f"elem: {elem}")
             messages.append(elem)
             start = match.end()
+
+    # 处理 CQ 码之后的文本
     if text_segment := text[start:]:
         messages.append(Plain(text_segment))
 
-    return MessageChain(*messages)
-
+    message_chain = MessageChain(*messages)
+    message_chain.image_urls = image_urls  # 将图片 URL 列表添加到 MessageChain 对象中
+    return message_chain
 
 def transform_from_message_chain(chain: MessageChain):
     result = ''
@@ -105,7 +111,6 @@ def transform_from_message_chain(chain: MessageChain):
         elif isinstance(elem, Voice):
             result = result + MessageSegment.record(f"base64://{elem.base64}")
     return result
-
 
 def response(event, is_group: bool):
     async def respond(resp):
@@ -130,47 +135,87 @@ def response(event, is_group: bool):
 
     return respond
 
-
 FriendTrigger = DetectPrefix(config.trigger.prefix + config.trigger.prefix_friend)
-
 
 @bot.on_message('private')
 async def _(event: Event):
+    logger.debug(f"收到消息: event.message = {event.message}")
     if event.message.startswith('.'):
         return
-    chain = transform_message_chain(event.message)
-    try:
-        msg = await FriendTrigger(chain, None)
-    except:
-        logger.debug(f"丢弃私聊消息：{event.message}（原因：不符合触发前缀）")
-        return
+    chain = await transform_message_chain(event.message)
+    logger.debug(f"转换后的消息链: chain = {chain}")
+    logger.debug(f"chain 中是否含有 Image: {chain.has(Image)}")
 
-    logger.debug(f"私聊消息：{event.message}")
+    # # 提取图片 URL
+    # image_url_list = []
+    # for element in chain:
+    #     if isinstance(element, Image):
+    #         image_url_list.append(element.url)
+    if chain.has(Image):
+            # 如果有图片，则不进行前缀匹配，直接处理
+            msg = chain
+    else:
+            # 如果没有图片，则进行前缀匹配
+            try:
+                msg = await FriendTrigger(chain, None)
+            except:
+                logger.debug(f"丢弃私聊消息：{event.message}（原因：不符合触发前缀）")
+                return
+    logger.debug(f"经过前缀检测的消息链: msg = {msg}")
 
-    try:
-        await handle_message(
-            response(event, False),
-            f"friend-{event.user_id}",
-            msg.display,
-            chain,
-            is_manager=event.user_id == config.onebot.manager_qq,
-            nickname=event.sender.get("nickname", "好友"),
-            request_from=constants.BotPlatform.Onebot
-        )
-    except Exception as e:
-        logger.exception(e)
-
+    await handle_message(
+        response(event, False),
+        f"friend-{event.user_id}",
+        msg if msg else chain,
+        chain,
+        is_manager=event.user_id == config.onebot.manager_qq,
+        nickname=event.sender.get("nickname", "好友"),
+        request_from=constants.BotPlatform.Onebot
+    )
 
 GroupTrigger = [MentionMe(config.trigger.require_mention != "at"), DetectPrefix(
-    config.trigger.prefix + config.trigger.prefix_group)] if config.trigger.require_mention != "none" else [
-    DetectPrefix(config.trigger.prefix)]
-
+config.trigger.prefix + config.trigger.prefix_group)] if config.trigger.require_mention != "none" else [
+DetectPrefix(config.trigger.prefix)]
 
 @bot.on_message('group')
 async def _(event: Event):
     if event.message.startswith('.'):
         return
-    chain = transform_message_chain(event.message)
+    chain = await transform_message_chain(event.message)
+
+    # # 提取图片 URL
+    # image_url_list = []
+    # for element in chain:
+    #     if isinstance(element, Image):
+    #         image_url_list.append(element.url)
+
+    # 判断是否被 @
+    try:
+        is_mentioned = await MentionMe(config.trigger.require_mention != "at")(chain, event)
+    except ExecutionStop:
+        is_mentioned = False
+
+    if chain.has(Image):  # 如果是图片消息
+        if is_mentioned:  # 且被 @ 了
+            # 移除 @ 符号
+            if config.trigger.require_mention == "at":
+              chain = is_mentioned
+            logger.debug(f"群聊消息(图片+{'' if chain.display else '无'}文本)：{event.message}")
+
+            await handle_message(
+                response(event, True),
+                f"group-{event.group_id}",
+                chain,
+                chain,
+                is_manager=event.user_id == config.onebot.manager_qq,
+                nickname=event.sender.get("nickname", "群友"),
+                request_from=constants.BotPlatform.Onebot
+            )
+        else:
+            logger.debug(f"丢弃群聊消息：{event.message}（原因：含有图片但未触发）")
+        return # 处理完图片消息后直接返回
+
+    # 非图片消息，执行原逻辑
     try:
         for it in GroupTrigger:
             chain = await it(chain, event)
@@ -183,12 +228,12 @@ async def _(event: Event):
     await handle_message(
         response(event, True),
         f"group-{event.group_id}",
-        chain.display,
+        chain,
+        chain,
         is_manager=event.user_id == config.onebot.manager_qq,
         nickname=event.sender.get("nickname", "群友"),
         request_from=constants.BotPlatform.Onebot
     )
-
 
 @bot.on_message()
 async def _(event: Event):
