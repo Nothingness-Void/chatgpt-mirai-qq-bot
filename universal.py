@@ -40,7 +40,7 @@ async def get_ping_response(conversation_context: ConversationContext):
     return response
 
 
-async def handle_message(_respond: Callable, session_id: str, message: str,
+async def handle_message(_respond: Callable, session_id: str, message: MessageChain, 
                          chain: MessageChain = MessageChain("Unsupported"), is_manager: bool = False,
                          nickname: str = '某人', request_from=BotPlatform.AriadneBot):
     conversation_context = None
@@ -220,7 +220,11 @@ async def handle_message(_respond: Callable, session_id: str, message: str,
 
         # 没有任务那就聊天吧！
         if not task:
-            task = conversation_context.ask(prompt=prompt, chain=chain, name=nickname)
+            image_urls = getattr(message, 'image_urls', [])
+            if image_urls:
+                task = conversation_context.ask(prompt=text, chain=chain, name=nickname, image_url_list=image_urls)
+            else:
+                task = conversation_context.ask(prompt=text, chain=chain, name=nickname)
         async for rendered in task:
             if rendered:
                 if not str(rendered).strip():
@@ -236,39 +240,50 @@ async def handle_message(_respond: Callable, session_id: str, message: str,
             await m.handle_respond_completed(session_id, prompt, respond)
 
     try:
-        if not message.strip():
+        # 检查 message 是否为空
+        if not message.display.strip() and not getattr(message, 'image_urls', []):
             return await respond(config.response.placeholder)
 
+        text = message.display
+
         for r in config.trigger.ignore_regex:
-            if re.match(r, message):
+            if isinstance(text, str) and re.match(r, text):
                 logger.debug(f"此消息满足正则表达式： {r}，忽略……")
                 return
 
         # 此处为会话不存在时可以执行的指令
         conversation_handler = await ConversationHandler.get_handler(session_id)
         # 指定前缀对话
-        if ' ' in message and (config.trigger.allow_switching_ai or is_manager):
+        if isinstance(text, str) and ' ' in text and (config.trigger.allow_switching_ai or is_manager):
             for ai_type, prefixes in config.trigger.prefix_ai.items():
                 for prefix in prefixes:
-                    if f'{prefix} ' in message:
+                    if f'{prefix} ' in text:
                         conversation_context = await conversation_handler.first_or_create(ai_type)
-                        message = message.removeprefix(f'{prefix} ')
+                        text = text.removeprefix(f'{prefix} ')
                         break
                 else:
-                    # Continue if the inner loop wasn't broken.
                     continue
-                # Inner loop was broken, break the outer.
                 break
+
         if not conversation_handler.current_conversation:
             conversation_handler.current_conversation = await conversation_handler.create(
                 config.response.default_ai)
-
+            
+        image_urls = getattr(message, 'image_urls', [])
+        if image_urls:
+            # 当用户发送了图片，无论是否还有其他文本，都将 message 传递给 request 处理。
+            logger.debug(f"检测到图片消息，图片 URL 列表：{image_urls}")
+            msg = message
+        else:
+            # 纯文字消息
+            msg = text
         action = request
+        
         for m in middlewares:
             action = wrap_request(action, m)
 
         # 开始处理
-        await action(session_id, message.strip(), conversation_context, respond)
+        await action(session_id, message, conversation_context, respond)
     except DrawingFailedException as e:
         logger.exception(e)
         await _respond(config.response.error_drawing.format(exc=e.__cause__ or '未知'))
@@ -296,3 +311,10 @@ async def handle_message(_respond: Callable, session_id: str, message: str,
     except Exception as e:  # 未处理的异常
         logger.exception(e)
         await _respond(config.response.error_format.format(exc=e))
+class ImageMessage:
+    def __init__(self, text, image_url_list):
+        self.text = text
+        self.image_url_list = image_url_list  # 现在存储 URL 列表
+
+    def __str__(self):
+        return self.text
