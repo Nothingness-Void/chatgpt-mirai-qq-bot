@@ -5,6 +5,9 @@ import async_timeout
 import tiktoken
 from loguru import logger
 from typing import AsyncGenerator
+import base64
+import httpx
+from typing import AsyncGenerator, Optional
 
 from adapter.botservice import BotAdapter
 from config import OpenAIAPIKey
@@ -12,8 +15,8 @@ from constants import botManager, config
 
 DEFAULT_ENGINE: str = "gpt-3.5-turbo"
 
-
 class OpenAIChatbot:
+    # ... (OpenAIChatbot 类的代码保持不变)
     def __init__(self, api_info: OpenAIAPIKey):
         self.api_key = api_info.api_key
         self.proxy = api_info.proxy
@@ -86,8 +89,16 @@ class OpenAIChatbot:
         """Get max tokens"""
         return self.max_tokens - self.count_tokens(session_id, model)
 
-
 class ChatGPTAPIAdapter(BotAdapter):
+    # ... (其他的代码保持不变)
+
+    async def _download_and_encode_image(self, url: str) -> str:
+        """下载图片并进行 base64 编码"""
+        async with httpx.AsyncClient() as client:
+            response = await client.get(url)
+            response.raise_for_status()
+            return base64.b64encode(response.content).decode('utf-8')
+        
     api_info: OpenAIAPIKey = None
     """API Key"""
 
@@ -148,11 +159,52 @@ class ChatGPTAPIAdapter(BotAdapter):
         self.bot.engine = self.current_model
         self.__conversation_keep_from = 0
 
-    def construct_data(self, messages: list = None, api_key: str = None, stream: bool = True):
+    def construct_data(self, messages: list = None, api_key: str = None, stream: bool = True, image_url_list: Optional[list] = None):
         headers = {
             'Content-Type': 'application/json',
             'Authorization': f'Bearer {api_key}'
         }
+        # 只有当 image_url_list 不为空时才处理图片
+        if image_url_list:
+            logger.debug(f"发现图片，正在处理: {image_url_list}")
+            has_user_message = False  # 标记是否有用户消息
+            for message in messages:
+                if message["role"] == "user":
+                    has_user_message = True
+                    new_content = []
+                    if message["content"]:
+                        new_content.append({
+                            "type": "text",
+                            "text": message["content"]
+                        })
+                    for img_url in image_url_list:
+                        new_content.append({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_url}"  # 使用 base64 数据 URL
+                            }
+                        })
+                    message["content"] = new_content
+            
+            # 如果没有用户消息，则添加一个默认的用户消息
+            if not has_user_message:
+                messages.append({
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "请描述这张图片"  # 默认文本
+                        }
+                    ] + [
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{img_url}"
+                            }
+                        } for img_url in image_url_list
+                    ]
+                })
+
         data = {
             'model': self.bot.engine,
             'messages': messages,
@@ -166,7 +218,7 @@ class ChatGPTAPIAdapter(BotAdapter):
         }
         return headers, data
 
-    def _prepare_request(self, session_id: str = None, messages: list = None, stream: bool = False):
+    def _prepare_request(self, session_id: str = None, messages: list = None, stream: bool = False, image_url_list: Optional[list] = None):
         self.api_info = botManager.pick('openai-api')
         api_key = self.api_info.api_key
         proxy = self.api_info.proxy
@@ -175,7 +227,7 @@ class ChatGPTAPIAdapter(BotAdapter):
         if not messages:
             messages = self.bot.conversation[session_id]
 
-        headers, data = self.construct_data(messages, api_key, stream)
+        headers, data = self.construct_data(messages, api_key, stream, image_url_list)
 
         return proxy, api_endpoint, headers, data
 
@@ -201,8 +253,8 @@ class ChatGPTAPIAdapter(BotAdapter):
 
         return content
 
-    async def request(self, session_id: str = None, messages: list = None) -> str:
-        proxy, api_endpoint, headers, data = self._prepare_request(session_id, messages, stream=False)
+    async def request(self, session_id: str = None, messages: list = None, image_url_list: Optional[list] = None) -> str:
+        proxy, api_endpoint, headers, data = self._prepare_request(session_id, messages, stream=False, image_url_list=image_url_list)
 
         async with aiohttp.ClientSession() as session:
             with async_timeout.timeout(self.bot.timeout):
@@ -284,7 +336,7 @@ class ChatGPTAPIAdapter(BotAdapter):
             token_count = self.bot.count_tokens(self.session_id, self.bot.engine)
             logger.debug(f"压缩会话后使用 token 数：{token_count}")
 
-    async def ask(self, prompt: str) -> AsyncGenerator[str, None]:
+    async def ask(self, prompt: str, image_url_list: Optional[list] = None) -> AsyncGenerator[str, None]:
         """Send a message to api and return the response with stream."""
 
         self.manage_conversation(self.session_id, prompt)
@@ -295,24 +347,34 @@ class ChatGPTAPIAdapter(BotAdapter):
         event_time = None
 
         try:
-            if self.bot.engine not in self.supported_models:
-                logger.warning(f"当前模型非官方支持的模型，请注意控制台输出，当前使用的模型为 {self.bot.engine}")
             logger.debug(f"[尝试使用ChatGPT-API:{self.bot.engine}] 请求：{prompt}")
+            # 调用图片转 base64
+            if image_url_list:
+                base64_images = []
+                for url in image_url_list:
+                    base64_image = await self._download_and_encode_image(url)
+                    base64_images.append(base64_image)
+                image_url_list = base64_images
             self.bot.add_to_conversation(prompt, "user", session_id=self.session_id)
             start_time = time.time()
 
             full_response = ''
+            # 将 image_url_list 传递给 _prepare_request
+            proxy, api_endpoint, headers, data = self._prepare_request(self.session_id, messages=self.bot.conversation[self.session_id], stream=config.openai.gpt_params.stream, image_url_list=image_url_list)
 
             if config.openai.gpt_params.stream:
-                async for resp in self.request_with_stream(session_id=self.session_id):
-                    full_response += resp
+                async for resp in self.request_with_stream(session_id=self.session_id, messages=data['messages']):
+                    full_response += resp.strip()
                     yield full_response
 
                 token_count = self.bot.count_tokens(self.session_id, self.bot.engine)
                 logger.debug(f"[ChatGPT-API:{self.bot.engine}] 响应：{full_response}")
                 logger.debug(f"[ChatGPT-API:{self.bot.engine}] 使用 token 数：{token_count}")
             else:
-                yield await self.request(session_id=self.session_id)
+                # 非流式请求，需要传入 image_url_list
+                response = await self.request(session_id=self.session_id, messages=data['messages'], image_url_list=image_url_list)
+                response = response.strip()
+                yield response
             event_time = time.time() - start_time
             if event_time is not None:
                 logger.debug(f"[ChatGPT-API:{self.bot.engine}] 接收到全部消息花费了{event_time:.2f}秒")
